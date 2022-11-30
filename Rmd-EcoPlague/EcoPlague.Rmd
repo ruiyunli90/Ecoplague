@@ -1,0 +1,158 @@
+---
+title: "Elevational effects on plague"
+author: "Ruiyun Li"
+date: "10 October 2022"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+This is a R Markdown document attached to **Elevation drives the coupled species shifts and disease risks**. authors: Ruiyun Li, Chao Su, Zhe Lou, Zhizhong Song,, Ennian Pu, Yuqiong Li, and Zihou Gao
+
+In this document, we will use a we GAM-SIR inference framework to (1) assess the *coupled response in the ecology of rodents and fleas to elevation*; (2) examine the *ecological dependence of plague* by using the elevation-based changes in species abundance.
+
+## Preparation
+
+We will first load packages:
+
+```{r}
+
+library(foreign)
+library(ggplot2)
+library(nlme)
+library(lme4)
+library(arm)
+library(mgcv)
+library(deSolve)
+library(splines)
+
+```
+
+We make ecological analysis to investigate the coupled ecological response of rodents and fleas to elevational changes. We restrict our analysis to interactions between hosts, vectors, and elevation. This is achieved by incorporating the long-term flea and rodent surveillance data, as well as climate and elevation data, into a GAM:
+
+```{r}
+
+RodentFlea <- file.path("RodentFlea")
+
+fc.gam.NB <- gam(Vectored.Flea.index ~ s(Elevation, bs="cr",k=3) +
+                   s(temp.avg.t1, bs="cr",k=3) + 
+                   s(prec.days.t1, bs="cr",k=3) + 
+                   s(Vectored.Flea.index.t1, bs="cr",k=3),
+                 family=nb(link=log), data=RodentFlea, method="GCV.Cp")
+
+newdata.df <- data.frame(DEM=RodentFlea$DEM,
+                         Vectored.Flea.index.t1 = RodentFlea$Vectored.Flea.index.t1,
+                         temp.avg.t1 = RodentFlea$temp.avg.t1, 
+                         prec.days.t1 = RodentFlea$prec.days.t1)
+
+predict.cf <- predict.gam(fc.gam.NB, newdata.df, type="response", na.action=na.pass, se=TRUE)
+
+
+```
+
+We now make epidemiological model simulations:
+
+```{r message = FALSE, warning = FALSE}
+
+pfn = function(x, lm.beta_bs){
+  return(exp(as.numeric(predict(lm.beta_bs, newdata = data.frame(mos=x)))))
+}
+
+pfn1 = function(x){ 
+  as.numeric(predict(lm.M_bs, newdata = data.frame(times=mos[x])))
+}
+
+mseirkmod_seasonal_V2 = function(t, x, params, lmb){ ## model V1 plus recover rate, varying tot N
+  
+  S = x[1]
+  I = x[2]
+  R = x[3]
+  K = x[4]
+  
+  with(as.list(params),{
+    
+    dS = - pfn(t, lmb) * abs(pfn1(t)) * S * I/N
+    dI = pfn(t, lmb) * abs(pfn1(t)) * S * I/N - exp(gamma) * I
+    dR = exp(gamma) * exp(f) * I 
+    dK = pfn(t, lmb) * abs(pfn1(t)) * S * I/N
+    
+    N = dS + dI + dR
+    res = c(dS, dI, dR, dK)
+    
+    list(res)
+  })
+}
+
+
+lfn3_V1 = function(p, I, N, lmb){
+  mos = seq(1, 12)
+  lm.beta_bs = lm(runif(12) ~ bs(mos, df=3))
+  lm.beta_bs$coefficients=p[1:4]
+  
+  paras = c(gamma=log(30/11), f=log(0.02))
+  start = c(S = N-1, I=1, R=0, K=0)
+  
+  out = as.data.frame(ode(start, times=mos, mseirkmod_seasonal_V2, paras, lmb=lm.beta_bs))
+  
+  predinci = c(start["I"], diff(out$K))
+  
+  rss = -sum(dpois(I, predinci, log = TRUE))
+  
+  return(rss)
+}
+
+# Optimize multiple parameters
+
+times = seq(1,12, 1)
+mos = seq(1, 12)
+RodentPop <- c(1000)
+
+y_mos <- c()
+newK_mos <- c()
+M.bsfit <- c() 
+fit_betacoef <- c() 
+fit_ll_betaspline <- c()
+out_betacoef <- c()
+out_newK <- c()
+out_SIRK <- c()
+
+for(g in 7:26){
+  N = RodentPop;
+  y_mos = Rodentplague
+    
+  M = Vectored.Flea.index.est
+  lm.M_bs <- lm(M ~ bs(times, df=11))
+  M.bsfit <- abs(pfn1(mos))
+    
+  lm.beta_bs = lm(runif(12) ~ bs(mos, df=3)) 
+  
+  paras0_V1 = c(as.numeric(lm.beta_bs$coefficients))
+    
+  fit_V1 = optim(fn=lfn3_V1, p=paras0_V1, I=y_mos, N=N, lmb=lm.beta_bs,
+                 hessian=TRUE,control=list(maxit=10000, trace=4))
+    print(fit_V1);
+    lm.beta_bs$coefficients <- fit_V1$par[1:4] 
+    fit_betacoef <- fit_V1$par[1:4]
+    fit_ll_betaspline = fit_V1$value
+    
+    start = c(S = N-1, I=1, R=0, K=0)
+    paras = c(gamma=log(30/g), f=log(0.02))
+    out = as.data.frame(ode(start, times=mos, mseirkmod_seasonal_V2, paras, lmb=lm.beta_bs))
+    
+    diff.K <- diff(out$K)
+    diff.K[diff.K < 0] = 0
+    newK_mos <- c(start["I"], diff.K)
+    
+    out_betacoef <- rbind(out_betacoef,
+                          c(fit_betacoef, 1991+(year-1), g))
+    out_newK <- rbind(out_newK,
+                      c(newK_mos, 1991+(year-1), g))
+    out_SIRK <- rbind(out_SIRK,
+                      cbind(out, rep(1991+(year-1),12), rep(g,12)))
+  }
+
+out_betacoef <- out_betacoef
+out_newK <- out_newK
+out_SIRK <- out_SIRK
+
+```
